@@ -4,14 +4,90 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
+use std::io::Read;
+use std::io::Write;
+use std::ops::Deref;
 use std::{fs, io};
 
-struct AssetRecord {
+fn align_up(val: u64, align: u64) -> u64 {
+    (val + (align - 1)) & !(align - 1)
+}
+
+const ASSET_ALIGN_SIZE: u64 = 64;
+
+#[derive(Debug)]
+struct FileHeader {
+    magic_number: u64,
+}
+
+impl FileHeader {
+    fn from_stream<T: Read>(stream: &mut T) -> Result<Self, io::Error> {
+        let magic_number = stream.read_u64::<LittleEndian>()?;
+
+        Ok(Self { magic_number })
+    }
+
+    fn to_stream<T: Write>(&self, stream: &mut T) -> Result<(), io::Error> {
+        stream.write_u64::<LittleEndian>(self.magic_number)?;
+        Ok(())
+    }
+
+    fn get_serialized_size() -> usize {
+        8
+    }
+}
+
+#[derive(Debug)]
+struct AssetTableHeader {
+    num_assets: u64,
+}
+
+impl AssetTableHeader {
+    fn from_stream<T: Read>(stream: &mut T) -> Result<Self, io::Error> {
+        let num_assets = stream.read_u64::<LittleEndian>()?;
+
+        Ok(Self { num_assets })
+    }
+
+    fn to_stream<T: Write>(&self, stream: &mut T) -> Result<(), io::Error> {
+        stream.write_u64::<LittleEndian>(self.num_assets)?;
+        Ok(())
+    }
+
+    fn get_serialized_size() -> usize {
+        8
+    }
+}
+
+#[derive(Debug)]
+struct AssetTableEntry {
+    id: u64,
     offset: u64,
     size: u64,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+impl AssetTableEntry {
+    fn from_stream<T: Read>(stream: &mut T) -> Result<Self, io::Error> {
+        let id = stream.read_u64::<LittleEndian>()?;
+        let offset = stream.read_u64::<LittleEndian>()?;
+        let size = stream.read_u64::<LittleEndian>()?;
+
+        Ok(Self { id, offset, size })
+    }
+
+    fn to_stream<T: Write>(&self, stream: &mut T) -> Result<(), io::Error> {
+        stream.write_u64::<LittleEndian>(self.id)?;
+        stream.write_u64::<LittleEndian>(self.offset)?;
+        stream.write_u64::<LittleEndian>(self.size)?;
+        Ok(())
+    }
+
+    fn get_serialized_size() -> usize {
+        24
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct AssetId(u64);
 
 impl AssetId {
@@ -22,73 +98,50 @@ impl AssetId {
     }
 }
 
-enum LibraryDataSource {
-    Buffer(Vec<u8>),
-    File(Mmap),
+#[derive(Debug, Default)]
+struct AssetTable {
+    entries: HashMap<AssetId, AssetTableEntry>,
 }
 
-type AssetHashMap = HashMap<AssetId, AssetRecord>;
+impl AssetTable {
+    fn from_stream<T: Read>(mut stream: &mut T) -> Result<Self, io::Error> {
+        let header = AssetTableHeader::from_stream(&mut stream)?;
+        let mut asset_table = AssetTable::default();
+        // TODO: Prevent infinite loops on num_assets and 32/64bit issues with offset/size
+        for _ in 0..header.num_assets {
+            let entry = AssetTableEntry::from_stream(&mut stream)?;
+            // TODO: Perform basic bounds checking here so it doesn't blow up later
+            asset_table.entries.insert(AssetId(entry.id), entry);
+        }
+
+        Ok(asset_table)
+    }
+}
 
 struct Library {
-    source: LibraryDataSource,
-    assets: AssetHashMap,
+    source: Mmap,
+    assets: AssetTable,
 }
 
 impl Library {
-    fn parse_asset_map(mut data: &[u8]) -> AssetHashMap {
-        let num_assets = data.read_u64::<LittleEndian>().unwrap();
-        let mut asset_map = AssetHashMap::new();
-        for _ in 0..num_assets {
-            let asset_id = AssetId(data.read_u64::<LittleEndian>().unwrap());
-
-            let asset_offset = data.read_u64::<LittleEndian>().unwrap();
-            let asset_size = data.read_u64::<LittleEndian>().unwrap();
-
-            let asset_record = AssetRecord {
-                offset: asset_offset,
-                size: asset_size,
-            };
-
-            asset_map.insert(asset_id, asset_record);
+    fn new(file: &File) -> Result<Self, io::Error> {
+        let source = unsafe { Mmap::map(file) }?;
+        let mut data = source.deref();
+        let file_header = FileHeader::from_stream(&mut data)?;
+        if file_header.magic_number != 0xdeadbeef_u64 {
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
         }
-
-        asset_map
-    }
-
-    fn from_buffer(buffer: Vec<u8>) -> Self {
-        let assets = Self::parse_asset_map(&buffer);
-        Self {
-            source: LibraryDataSource::Buffer(buffer),
-            assets,
-        }
-    }
-
-    fn from_file(path: &str) -> io::Result<Self> {
-        let file = File::open(path)?;
-        let mmap = unsafe { Mmap::map(&file) }?;
-        let assets = Self::parse_asset_map(&mmap);
-        Ok(Self {
-            source: LibraryDataSource::File(mmap),
-            assets,
-        })
+        let assets = AssetTable::from_stream(&mut data)?;
+        Ok(Self { source, assets })
     }
 
     fn num_assets(&self) -> usize {
-        self.assets.len()
-    }
-
-    fn data(&self) -> &[u8] {
-        match &self.source {
-            LibraryDataSource::Buffer(buffer) => buffer,
-            LibraryDataSource::File(mmap) => mmap,
-        }
+        self.assets.entries.len()
     }
 
     fn find_asset(&self, asset_id: AssetId) -> Option<&[u8]> {
-        if let Some(asset_record) = self.assets.get(&asset_id) {
-            let asset_data = &self.data()[(asset_record.offset as usize)
-                ..(asset_record.offset as usize + asset_record.size as usize)];
-            Some(asset_data)
+        if let Some(entry) = self.assets.entries.get(&asset_id) {
+            Some(&(&self.source)[(entry.offset as usize)..((entry.offset + entry.size) as usize)])
         } else {
             None
         }
@@ -96,36 +149,16 @@ impl Library {
 }
 
 #[derive(Clone)]
-enum AssetSource {
-    Buffer(Vec<u8>),
-    File(String),
-}
-
-fn query_asset_source_size(source: &AssetSource) -> usize {
-    match source {
-        AssetSource::Buffer(buffer) => buffer.len(),
-        AssetSource::File(path) => fs::metadata(path).unwrap().len() as usize,
-    }
-}
-
-#[derive(Clone)]
 struct AssetDescription {
     name: String,
-    source: AssetSource,
+    path: String,
 }
 
 impl AssetDescription {
-    fn from_buffer(name: &str, buffer: &[u8]) -> Self {
+    fn new(name: &str, path: &str) -> Self {
         Self {
             name: name.to_owned(),
-            source: AssetSource::Buffer(buffer.to_vec()),
-        }
-    }
-
-    fn from_file(name: &str, file_path: &String) -> Self {
-        Self {
-            name: name.to_owned(),
-            source: AssetSource::File(file_path.to_owned()),
+            path: path.to_owned(),
         }
     }
 }
@@ -149,59 +182,78 @@ impl Builder {
         self.assets.len()
     }
 
-    // TODO: Write data to a file instead of going through memory
-    fn build(&self) -> Vec<u8> {
-        let mut data = Vec::new();
+    fn build<T: Write>(&self, mut output: &mut T) -> Result<(), io::Error> {
+        let mut asset_entries = Vec::new();
 
-        let mut asset_map = HashMap::<String, (AssetId, AssetRecord)>::new();
+        let asset_data_base_offset = (FileHeader::get_serialized_size()
+            + AssetTableHeader::get_serialized_size()
+            + self.assets.len() * AssetTableEntry::get_serialized_size())
+            as u64;
 
-        let asset_data_base_offset = 8 + self.assets.len() * 24;
-        let mut cur_asset_data_offset = asset_data_base_offset as u64;
+        let aligned_asset_data_base_offset = align_up(asset_data_base_offset, ASSET_ALIGN_SIZE);
+
+        let mut cur_asset_data_offset = aligned_asset_data_base_offset;
+
         for desc in self.assets.values() {
             let mut hasher = DefaultHasher::new();
             desc.name.hash(&mut hasher);
-            let asset_id = AssetId(hasher.finish());
+            let id = hasher.finish();
 
-            let asset_record = AssetRecord {
-                offset: cur_asset_data_offset,
-                size: query_asset_source_size(&desc.source) as u64,
-            };
+            let offset = cur_asset_data_offset;
+            let size = fs::metadata(&desc.path).unwrap().len();
 
-            cur_asset_data_offset += asset_record.size;
+            // Ensure that new asset offsets always begin at an aligned address
+            cur_asset_data_offset += align_up(size, ASSET_ALIGN_SIZE);
 
-            asset_map.insert(desc.name.clone(), (asset_id, asset_record));
+            let entry = AssetTableEntry { id, offset, size };
+
+            asset_entries.push(entry);
         }
 
-        // Write the asset table
-        data.write_u64::<LittleEndian>(self.assets.len() as u64)
-            .unwrap();
-        for desc in self.assets.values() {
-            let asset_map_entry = asset_map.get(&desc.name).unwrap();
-            data.write_u64::<LittleEndian>(asset_map_entry.0 .0)
-                .unwrap();
-            data.write_u64::<LittleEndian>(asset_map_entry.1.offset)
-                .unwrap();
-            data.write_u64::<LittleEndian>(asset_map_entry.1.size)
-                .unwrap();
+        // Write the file header
+        let file_header = FileHeader {
+            magic_number: 0xdeadbeef_u64,
+        };
+        file_header.to_stream(&mut output)?;
+
+        // Write the asset table header
+        let asset_table_header = AssetTableHeader {
+            num_assets: asset_entries.len() as u64,
+        };
+        asset_table_header.to_stream(&mut output)?;
+
+        // Write the asset table entries
+        for entry in &asset_entries {
+            entry.to_stream(&mut output)?;
+        }
+
+        // Write padding bytes before the assets
+        let padding_bytes = aligned_asset_data_base_offset - asset_data_base_offset;
+        for _ in 0..padding_bytes {
+            output.write_u8(0)?;
         }
 
         // Write the asset data
         for desc in self.assets.values() {
-            match &desc.source {
-                AssetSource::Buffer(buffer) => {
-                    data.extend(buffer);
-                }
-                AssetSource::File(path) => {
-                    data.extend(fs::read(path).unwrap());
-                }
+            let mut file = File::open(&desc.path)?;
+            let mut bytes_copied = io::copy(&mut file, &mut output)?;
+
+            // Write padding bytes until we hit the required alignment for asset data
+            let aligned_size = align_up(bytes_copied, ASSET_ALIGN_SIZE);
+            while bytes_copied != aligned_size {
+                output.write_u8(0)?;
+                bytes_copied += 1;
             }
         }
-        data
+
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::Seek;
+
     use super::*;
 
     fn make_asset_path(filename: &str) -> String {
@@ -209,24 +261,38 @@ mod tests {
     }
 
     #[test]
-    fn test_builder() {
+    fn align() {
+        assert_eq!(align_up(0, 4), 0);
+        assert_eq!(align_up(1, 4), 4);
+        assert_eq!(align_up(2, 4), 4);
+        assert_eq!(align_up(3, 4), 4);
+        assert_eq!(align_up(4, 4), 4);
+
+        assert_eq!(align_up(54, 64), 64);
+    }
+
+    #[test]
+    fn test_builder() -> Result<(), io::Error> {
         let mut builder = Builder::new();
 
-        builder.insert(&AssetDescription::from_file(
+        builder.insert(&AssetDescription::new(
             "Test0",
             &make_asset_path("test0.txt"),
         ));
-        builder.insert(&AssetDescription::from_file(
+        builder.insert(&AssetDescription::new(
             "Test1",
             &make_asset_path("test1.txt"),
         ));
-        builder.insert(&AssetDescription::from_file(
+        builder.insert(&AssetDescription::new(
             "Test2",
             &make_asset_path("test2.txt"),
         ));
 
-        let data = builder.build();
-        let library = Library::from_buffer(data);
+        let mut file = tempfile::tempfile()?;
+        builder.build(&mut file)?;
+        file.rewind()?;
+
+        let library = Library::new(&file)?;
 
         assert_eq!(library.num_assets(), 3);
 
@@ -241,5 +307,7 @@ mod tests {
         let test2_asset_data = library.find_asset(AssetId::from_str("Test2")).unwrap();
         let test2_file_data_vec = fs::read(make_asset_path("test2.txt")).unwrap();
         assert_eq!(test2_asset_data, &test2_file_data_vec);
+
+        Ok(())
     }
 }

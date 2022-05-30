@@ -8,3 +8,4 @@ edition = "2021"
 [dependencies]
 memmap = "0.7"
 byteorder = "1"
+tempfile = "3"
