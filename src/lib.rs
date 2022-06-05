@@ -7,6 +7,7 @@ use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::io::Write;
 use std::ops::Deref;
+use std::sync::Arc;
 use std::{fs, io};
 
 fn align_up(val: u64, align: u64) -> u64 {
@@ -118,13 +119,13 @@ impl AssetTable {
     }
 }
 
-struct Library {
-    source: Mmap,
+pub struct Library {
+    source: Arc<AssetSource>,
     assets: AssetTable,
 }
 
 impl Library {
-    fn new(file: &File) -> Result<Self, io::Error> {
+    pub fn new(file: &File) -> Result<Self, io::Error> {
         let source = unsafe { Mmap::map(file) }?;
         let mut data = source.deref();
         let file_header = FileHeader::from_stream(&mut data)?;
@@ -132,57 +133,40 @@ impl Library {
             return Err(io::Error::from(io::ErrorKind::InvalidData));
         }
         let assets = AssetTable::from_stream(&mut data)?;
+        let source = Arc::new(AssetSource { handle: source });
         Ok(Self { source, assets })
-    }
-
-    fn num_assets(&self) -> usize {
-        self.assets.entries.len()
-    }
-
-    fn find_asset(&self, asset_id: AssetId) -> Option<&[u8]> {
-        if let Some(entry) = self.assets.entries.get(&asset_id) {
-            Some(&(&self.source)[(entry.offset as usize)..((entry.offset + entry.size) as usize)])
-        } else {
-            None
-        }
     }
 }
 
 #[derive(Clone)]
-struct AssetDescription {
-    name: String,
+pub struct AssetDescription {
     path: String,
 }
 
 impl AssetDescription {
-    fn new(name: &str, path: &str) -> Self {
+    pub fn new(path: &str) -> Self {
         Self {
-            name: name.to_owned(),
             path: path.to_owned(),
         }
     }
 }
 
-struct Builder {
+pub struct Builder {
     assets: HashMap<String, AssetDescription>,
 }
 
 impl Builder {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             assets: HashMap::new(),
         }
     }
 
-    fn insert(&mut self, asset: &AssetDescription) {
-        self.assets.insert(asset.name.clone(), asset.clone());
+    pub fn insert(&mut self, asset: &AssetDescription) {
+        self.assets.insert(asset.path.clone(), asset.clone());
     }
 
-    fn num_assets(&self) -> usize {
-        self.assets.len()
-    }
-
-    fn build<T: Write>(&self, mut output: &mut T) -> Result<(), io::Error> {
+    pub fn build<T: Write>(&self, mut output: &mut T) -> Result<(), io::Error> {
         let mut asset_entries = Vec::new();
 
         let asset_data_base_offset = (FileHeader::get_serialized_size()
@@ -196,7 +180,7 @@ impl Builder {
 
         for desc in self.assets.values() {
             let mut hasher = DefaultHasher::new();
-            desc.name.hash(&mut hasher);
+            desc.path.hash(&mut hasher);
             let id = hasher.finish();
 
             let offset = cur_asset_data_offset;
@@ -250,6 +234,124 @@ impl Builder {
     }
 }
 
+impl Default for Builder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct Asset {
+    path: String,
+    offset: u64,
+    size: u64,
+    source: Arc<AssetSource>,
+}
+
+impl Asset {
+    pub fn path(&self) -> &String {
+        &self.path
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &(&self.source.handle)[(self.offset as usize)..((self.offset + self.size) as usize)]
+    }
+}
+
+struct AssetSource {
+    handle: Mmap,
+}
+
+pub trait AssetLoader {
+    fn load(&self, path: &str) -> Option<Arc<Asset>>;
+}
+
+pub struct FileAssetLoader {}
+
+impl FileAssetLoader {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl Default for FileAssetLoader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AssetLoader for FileAssetLoader {
+    fn load(&self, path: &str) -> Option<Arc<Asset>> {
+        let mut result = None;
+
+        if let Ok(file) = File::open(path) {
+            if let Ok(mmap) = unsafe { Mmap::map(&file) } {
+                let path = path.to_owned();
+                let offset = 0;
+                let size = mmap.len() as u64;
+                let source = Arc::new(AssetSource { handle: mmap });
+                let asset = Arc::new(Asset {
+                    path,
+                    offset,
+                    size,
+                    source,
+                });
+
+                result = Some(asset);
+            }
+        }
+
+        result
+    }
+}
+
+impl AssetLoader for Library {
+    fn load(&self, path: &str) -> Option<Arc<Asset>> {
+        let mut result = None;
+
+        if let Some(entry) = self.assets.entries.get(&AssetId::from_str(path)) {
+            let path = path.to_owned();
+            let offset = entry.offset;
+            let size = entry.size;
+            let asset = Arc::new(Asset {
+                path,
+                offset,
+                size,
+                source: self.source.clone(),
+            });
+
+            result = Some(asset);
+        }
+
+        result
+    }
+}
+
+pub struct AssetManager<T: AssetLoader> {
+    assets: HashMap<String, Arc<Asset>>,
+    loader: T,
+}
+
+impl<T: AssetLoader> AssetManager<T> {
+    pub fn new(loader: T) -> Self {
+        Self {
+            assets: HashMap::new(),
+            loader,
+        }
+    }
+
+    pub fn load(&mut self, path: &str) -> Option<Arc<Asset>> {
+        let mut result = None;
+        if let Some(asset) = self.assets.get(path) {
+            result = Some(asset.clone());
+        } else if let Some(asset) = self.loader.load(path) {
+            result = Some(asset.clone());
+            self.assets.insert(path.to_owned(), asset);
+        }
+
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Seek;
@@ -258,6 +360,14 @@ mod tests {
 
     fn make_asset_path(filename: &str) -> String {
         format!("{}/testing/{}", env!("CARGO_MANIFEST_DIR"), filename)
+    }
+
+    fn get_test_asset_paths() -> Vec<String> {
+        vec![
+            make_asset_path("test0.txt"),
+            make_asset_path("test1.txt"),
+            make_asset_path("test2.txt"),
+        ]
     }
 
     #[test]
@@ -272,21 +382,28 @@ mod tests {
     }
 
     #[test]
-    fn test_builder() -> Result<(), io::Error> {
+    fn filesystem() {
+        let asset_paths = get_test_asset_paths();
+
+        let loader = FileAssetLoader::new();
+        let mut mgr = AssetManager::<FileAssetLoader>::new(loader);
+
+        for path in &asset_paths {
+            let asset = mgr.load(path).unwrap();
+            let file_data = fs::read(path).unwrap();
+            assert_eq!(asset.data(), &file_data);
+        }
+    }
+
+    #[test]
+    fn library() -> Result<(), io::Error> {
+        let asset_paths = get_test_asset_paths();
+
         let mut builder = Builder::new();
 
-        builder.insert(&AssetDescription::new(
-            "Test0",
-            &make_asset_path("test0.txt"),
-        ));
-        builder.insert(&AssetDescription::new(
-            "Test1",
-            &make_asset_path("test1.txt"),
-        ));
-        builder.insert(&AssetDescription::new(
-            "Test2",
-            &make_asset_path("test2.txt"),
-        ));
+        for path in &asset_paths {
+            builder.insert(&AssetDescription::new(path));
+        }
 
         let mut file = tempfile::tempfile()?;
         builder.build(&mut file)?;
@@ -294,19 +411,13 @@ mod tests {
 
         let library = Library::new(&file)?;
 
-        assert_eq!(library.num_assets(), 3);
+        let mut mgr = AssetManager::<Library>::new(library);
 
-        let test0_asset_data = library.find_asset(AssetId::from_str("Test0")).unwrap();
-        let test0_file_data_vec = fs::read(make_asset_path("test0.txt")).unwrap();
-        assert_eq!(test0_asset_data, &test0_file_data_vec);
-
-        let test1_asset_data = library.find_asset(AssetId::from_str("Test1")).unwrap();
-        let test1_file_data_vec = fs::read(make_asset_path("test1.txt")).unwrap();
-        assert_eq!(test1_asset_data, &test1_file_data_vec);
-
-        let test2_asset_data = library.find_asset(AssetId::from_str("Test2")).unwrap();
-        let test2_file_data_vec = fs::read(make_asset_path("test2.txt")).unwrap();
-        assert_eq!(test2_asset_data, &test2_file_data_vec);
+        for path in &asset_paths {
+            let asset = mgr.load(path).unwrap();
+            let file_data = fs::read(path).unwrap();
+            assert_eq!(asset.data(), &file_data);
+        }
 
         Ok(())
     }
