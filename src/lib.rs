@@ -1,6 +1,6 @@
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use memmap::Mmap;
-use std::collections::hash_map::DefaultHasher;
+use std::collections::hash_map::{self, DefaultHasher};
 use std::collections::HashMap;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
@@ -119,6 +119,18 @@ impl AssetTable {
     }
 }
 
+pub struct LibraryAssetIterator<'a> {
+    inner: hash_map::Values<'a, AssetId, AssetTableEntry>,
+}
+
+impl<'a> Iterator for LibraryAssetIterator<'a> {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|entry| entry.id)
+    }
+}
+
 pub struct Library {
     source: Arc<AssetSource>,
     assets: AssetTable,
@@ -135,6 +147,12 @@ impl Library {
         let assets = AssetTable::from_stream(&mut data)?;
         let source = Arc::new(AssetSource { handle: source });
         Ok(Self { source, assets })
+    }
+
+    pub fn assets(&self) -> LibraryAssetIterator {
+        LibraryAssetIterator {
+            inner: self.assets.entries.values(),
+        }
     }
 }
 

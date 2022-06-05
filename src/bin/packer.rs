@@ -25,13 +25,8 @@ pub fn main() {
         .filter_map(|e| e.ok())
     {
         if entry.metadata().unwrap().is_file() {
-
             // TODO: Make this work with relative paths instead of absolute (You'll need to add a base path to the builder)
-            let path = entry
-                .path()
-                .to_str()
-                .unwrap()
-                .replace('\\', "/");
+            let path = entry.path().to_str().unwrap().replace('\\', "/");
             let desc = AssetDescription::new(&path);
 
             println!("Found Asset: {}", &path);
