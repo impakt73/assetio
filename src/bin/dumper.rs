@@ -17,6 +17,10 @@ pub fn main() {
     let file = File::open(args.path).unwrap();
     let library = Library::new(&file).unwrap();
     for asset in library.assets() {
-        println!("Found Asset: {}", &asset);
+        println!(
+            "Found Asset: [Id: {:#x}, Size: {}]",
+            asset.id.raw(),
+            asset.size
+        );
     }
 }

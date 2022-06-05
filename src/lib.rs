@@ -89,13 +89,17 @@ impl AssetTableEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct AssetId(u64);
+pub struct AssetId(u64);
 
 impl AssetId {
     fn from_str(str: &str) -> Self {
         let mut hasher = DefaultHasher::new();
         str.hash(&mut hasher);
         Self(hasher.finish())
+    }
+
+    pub fn raw(&self) -> u64 {
+        self.0
     }
 }
 
@@ -119,15 +123,23 @@ impl AssetTable {
     }
 }
 
+pub struct LibraryAssetDescription {
+    pub id: AssetId,
+    pub size: usize,
+}
+
 pub struct LibraryAssetIterator<'a> {
     inner: hash_map::Values<'a, AssetId, AssetTableEntry>,
 }
 
 impl<'a> Iterator for LibraryAssetIterator<'a> {
-    type Item = u64;
+    type Item = LibraryAssetDescription;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|entry| entry.id)
+        self.inner.next().map(|entry| LibraryAssetDescription {
+            id: AssetId(entry.id),
+            size: entry.size as usize,
+        })
     }
 }
 
