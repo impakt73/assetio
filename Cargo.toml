@@ -9,3 +9,7 @@ edition = "2021"
 memmap = "0.7"
 byteorder = "1"
 tempfile = "3"
+
+# TODO: This should be removed when the packer is moved outside the crate
+walkdir = "2"
+clap = { version = "3", features = ["derive"] }
